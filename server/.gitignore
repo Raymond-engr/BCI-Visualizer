@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+*.log
+combined.log
+error.log
+coverage/
+src/uploads/datasets/*
+!src/uploads/datasets/.gitkeep
+models/*.onnx
+models/*.gdf

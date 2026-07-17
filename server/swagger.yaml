@@ -1,0 +1,500 @@
+openapi: 3.0.3
+
+info:
+  title: BCI Visualizer API
+  version: 1.0.0
+  description: >
+    Backend for the Web-Based Brain-Computer Interface Motor Imagery
+    Visualizer. Recordings are uploaded over REST; the analysed signal,
+    spectrum, topography and per-epoch classification are delivered over a
+    WebSocket at /ws/stream.
+
+servers:
+  - url: http://localhost:5000/api/v1
+    description: Local development
+
+tags:
+  - name: Health
+  - name: Auth
+  - name: Datasets
+  - name: Sessions
+  - name: Results
+  - name: Preferences
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+
+  schemas:
+    Success:
+      type: object
+      properties:
+        success: { type: boolean, example: true }
+        message: { type: string }
+        data: { type: object, nullable: true }
+
+    Error:
+      type: object
+      properties:
+        success: { type: boolean, example: false }
+        message: { type: string }
+        errors: { type: array, items: { type: object }, nullable: true }
+
+    MILabel:
+      type: string
+      description: >
+        The Motor Imagery classes the model discriminates. Tongue imagery is
+        excluded; see the project README.
+      enum: [left_hand, right_hand, feet, unknown]
+
+    User:
+      type: object
+      properties:
+        id: { type: string }
+        name: { type: string }
+        email: { type: string, format: email }
+        role: { type: string, enum: [admin, researcher] }
+
+    Dataset:
+      type: object
+      properties:
+        _id: { type: string }
+        userId: { type: string }
+        originalName: { type: string, example: A01T.gdf }
+        format: { type: string, enum: [gdf, csv] }
+        status: { type: string, enum: [uploaded, parsed, invalid] }
+        sizeBytes: { type: integer }
+        channelCount: { type: integer, example: 22 }
+        sampleRate: { type: number, example: 250 }
+        sampleCount: { type: integer }
+        durationSeconds: { type: number }
+        eventCount: { type: integer }
+        subjectId: { type: string, nullable: true }
+        parseError: { type: string, nullable: true }
+        createdAt: { type: string, format: date-time }
+
+    Session:
+      type: object
+      properties:
+        _id: { type: string }
+        userId: { type: string }
+        datasetId: { type: string, nullable: true }
+        mode: { type: string, enum: [upload, simulation, hardware] }
+        status: { type: string, enum: [pending, active, completed, error] }
+        modelId: { type: string, example: global }
+        epochCount: { type: integer }
+        accuracy:
+          type: number
+          nullable: true
+          description: Null when the recording carries no usable cue events.
+        meanConfidence: { type: number, nullable: true }
+        meanInferenceMs: { type: number, nullable: true }
+        classDistribution:
+          type: object
+          additionalProperties: { type: integer }
+        startTime: { type: string, format: date-time }
+        endTime: { type: string, format: date-time, nullable: true }
+        durationSeconds: { type: number, nullable: true }
+        sourceLabel:
+          type: string
+          readOnly: true
+          description: >
+            Virtual. What the session history should title this row: the
+            dataset filename for upload sessions, otherwise "Live Simulation"
+            or "Hardware Stream".
+          example: Live Simulation
+        hasGroundTruth:
+          type: boolean
+          readOnly: true
+          description: >
+            Virtual. False for hardware sessions, which emit no cue events and
+            therefore can never have an accuracy. Distinguishes "cannot be
+            measured" from "not measured yet".
+
+    Preference:
+      type: object
+      properties:
+        userId: { type: string }
+        bandpassLow: { type: number, example: 8 }
+        bandpassHigh: { type: number, example: 30 }
+        notchEnabled: { type: boolean }
+        defaultMode: { type: string, enum: [upload, simulation, hardware] }
+        defaultModelId: { type: string }
+
+  responses:
+    Unauthorized:
+      description: Missing, expired or invalid access token
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    Forbidden:
+      description: The resource belongs to another user
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+    BadRequest:
+      description: Validation failed
+      content:
+        application/json:
+          schema: { $ref: '#/components/schemas/Error' }
+
+security:
+  - bearerAuth: []
+
+paths:
+  /health:
+    get:
+      tags: [Health]
+      summary: Liveness and dependency status
+      security: []
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+
+  /auth/register:
+    post:
+      tags: [Auth]
+      summary: Create an account
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [name, email, password]
+              properties:
+                name: { type: string, minLength: 2 }
+                email: { type: string, format: email }
+                password: { type: string, minLength: 8 }
+      responses:
+        '201':
+          description: >
+            Account created. Returns an access token; the refresh token is set
+            as an httpOnly cookie.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /auth/login:
+    post:
+      tags: [Auth]
+      summary: Exchange credentials for tokens
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email: { type: string, format: email }
+                password: { type: string }
+      responses:
+        '200':
+          description: Authenticated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/refresh-token:
+    post:
+      tags: [Auth]
+      summary: Rotate the refresh token cookie for a new access token
+      security: []
+      responses:
+        '200':
+          description: New access token issued
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /auth/logout:
+    post:
+      tags: [Auth]
+      summary: Revoke the refresh token and clear the cookie
+      responses:
+        '200':
+          description: Logged out
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+
+  /auth/verify-token:
+    get:
+      tags: [Auth]
+      summary: Validate the access token and return the current user
+      responses:
+        '200':
+          description: Token is valid
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+
+  /datasets/upload:
+    post:
+      tags: [Datasets]
+      summary: Upload and parse a recording
+      description: >
+        Accepts .gdf and .csv. The file is parsed synchronously, so the
+        response already reflects whether it is usable; an unparseable file is
+        stored with status "invalid" and its parse error.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required: [file]
+              properties:
+                file: { type: string, format: binary }
+      responses:
+        '201':
+          description: Dataset stored
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Success'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Dataset' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+
+  /datasets:
+    get:
+      tags: [Datasets]
+      summary: List the caller's datasets
+      responses:
+        '200':
+          description: Datasets retrieved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+
+  /datasets/{datasetId}:
+    get:
+      tags: [Datasets]
+      summary: Retrieve one dataset
+      parameters:
+        - name: datasetId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Dataset retrieved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Datasets]
+      summary: Delete a dataset and its stored file
+      parameters:
+        - name: datasetId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Dataset deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /sessions:
+    post:
+      tags: [Sessions]
+      summary: Reserve a streaming session
+      description: >
+        Create the session first, then open the WebSocket and send its id in
+        the INIT frame.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [mode]
+              properties:
+                mode: { type: string, enum: [upload, simulation, hardware] }
+                datasetId:
+                  type: string
+                  description: Required when mode is "upload".
+                modelId: { type: string }
+      responses:
+        '201':
+          description: Session created
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Success'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Session' }
+        '400': { $ref: '#/components/responses/BadRequest' }
+    get:
+      tags: [Sessions]
+      summary: List the caller's sessions
+      parameters:
+        - { name: page, in: query, schema: { type: integer, default: 1 } }
+        - { name: limit, in: query, schema: { type: integer, default: 50, maximum: 200 } }
+        - { name: mode, in: query, schema: { type: string, enum: [upload, simulation, hardware] } }
+        - { name: status, in: query, schema: { type: string, enum: [pending, active, completed, error] } }
+      responses:
+        '200':
+          description: Sessions retrieved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+
+  /sessions/{sessionId}:
+    get:
+      tags: [Sessions]
+      summary: Retrieve a session with its per-class breakdown
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Session retrieved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+    delete:
+      tags: [Sessions]
+      summary: Delete a session and its classifications
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Session deleted
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+
+  /sessions/{sessionId}/classifications:
+    get:
+      tags: [Sessions]
+      summary: The epoch-by-epoch classification log
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Classifications retrieved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+
+  /results/{sessionId}/export:
+    get:
+      tags: [Results]
+      summary: Export the classification log as CSV
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: CSV stream
+          content:
+            text/csv:
+              schema: { type: string }
+        '403': { $ref: '#/components/responses/Forbidden' }
+        '404': { $ref: '#/components/responses/NotFound' }
+
+  /results/{sessionId}/summary:
+    get:
+      tags: [Results]
+      summary: Aggregate statistics for a session
+      parameters:
+        - name: sessionId
+          in: path
+          required: true
+          schema: { type: string }
+      responses:
+        '200':
+          description: Summary retrieved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+
+  /preferences:
+    get:
+      tags: [Preferences]
+      summary: Retrieve the caller's settings, creating defaults if absent
+      responses:
+        '200':
+          description: Preferences retrieved
+          content:
+            application/json:
+              schema:
+                allOf:
+                  - $ref: '#/components/schemas/Success'
+                  - type: object
+                    properties:
+                      data: { $ref: '#/components/schemas/Preference' }
+    put:
+      tags: [Preferences]
+      summary: Update settings
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/Preference' }
+      responses:
+        '200':
+          description: Preferences updated
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
+        '400':
+          description: >
+            Rejected, e.g. a bandpass band this deployment has no precomputed
+            coefficients for.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /preferences/options:
+    get:
+      tags: [Preferences]
+      summary: The filter bands this deployment supports
+      responses:
+        '200':
+          description: Options retrieved
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Success' }
