@@ -491,7 +491,13 @@ paths:
   /preferences/options:
     get:
       tags: [Preferences]
-      summary: The filter bands this deployment supports
+      summary: The filter bands this deployment supports, plus the fixed pipeline constants
+      description: >
+        Returns `sampleRate`, `epochSeconds`, `notchFreq` and the `bandpassOptions`
+        this deployment has precomputed coefficients for. The first three are not
+        preferences — nothing can change them at runtime — but they are derived
+        from SAMPLE_RATE, so the settings page reads them here rather than
+        restating numbers that a differently configured deployment would break.
       responses:
         '200':
           description: Options retrieved

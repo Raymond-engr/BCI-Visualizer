@@ -1,9 +1,36 @@
+"use client"
+
+import { useState, type FormEvent } from "react"
 import Link from "next/link"
+import { useRouter } from "next/navigation"
 
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
+import { useAuth } from "@/contexts/AuthContext"
 
 export function SignInScreen() {
+  const router = useRouter()
+  const { login } = useAuth()
+
+  const [email, setEmail] = useState("")
+  const [password, setPassword] = useState("")
+  const [error, setError] = useState<string | null>(null)
+  const [pending, setPending] = useState(false)
+
+  async function onSubmit(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault()
+    setError(null)
+    setPending(true)
+
+    try {
+      await login(email, password)
+      router.push("/onboarding")
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not sign in")
+      setPending(false)
+    }
+  }
+
   return (
     <div className="mx-auto w-full max-w-[400px] px-4 pb-20 pt-6 sm:px-6">
       <Button
@@ -21,7 +48,7 @@ export function SignInScreen() {
       <p className="mb-7 text-sm text-muted-foreground">
         Resume your decoding sessions.
       </p>
-      <form className="flex flex-col gap-3.5">
+      <form className="flex flex-col gap-3.5" onSubmit={onSubmit}>
         <div className="flex flex-col gap-1.5">
           <label
             htmlFor="signin-email"
@@ -29,7 +56,15 @@ export function SignInScreen() {
           >
             EMAIL
           </label>
-          <Input id="signin-email" type="email" placeholder="you@uniben.edu" />
+          <Input
+            id="signin-email"
+            type="email"
+            required
+            autoComplete="email"
+            placeholder="you@uniben.edu"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+          />
         </div>
         <div className="flex flex-col gap-1.5">
           <label
@@ -38,15 +73,33 @@ export function SignInScreen() {
           >
             PASSWORD
           </label>
-          <Input id="signin-password" type="password" placeholder="••••••••" />
+          <Input
+            id="signin-password"
+            type="password"
+            required
+            autoComplete="current-password"
+            placeholder="••••••••"
+            value={password}
+            onChange={(e) => setPassword(e.target.value)}
+          />
         </div>
+
+        {error && (
+          <p
+            role="alert"
+            className="rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-[13px] text-destructive"
+          >
+            {error}
+          </p>
+        )}
+
         <Button
           size="lg"
+          type="submit"
+          disabled={pending}
           className="mt-1.5 h-auto rounded-xl py-3.5 text-[15px] shadow-[0_8px_24px_rgba(55,226,154,.28)]"
-          nativeButton={false}
-          render={<Link href="/onboarding" />}
         >
-          Sign In
+          {pending ? "Signing in…" : "Sign In"}
         </Button>
         <Button
           variant="outline"

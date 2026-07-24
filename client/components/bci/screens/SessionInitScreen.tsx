@@ -5,7 +5,12 @@ import Link from "next/link"
 import { useRouter, useSearchParams } from "next/navigation"
 
 import { Button } from "@/components/ui/button"
+import { Input } from "@/components/ui/input"
 import { useBciSession } from "@/contexts/BciSessionContext"
+import { useRequireAuth } from "@/hooks/useRequireAuth"
+import { uploadDataset } from "@/lib/api/datasets"
+import { createSession } from "@/lib/api/sessions"
+import { toSessionMode } from "@/lib/api/types"
 import { SOURCE_CONNECT_COPY, SOURCE_LABEL, type SessionSource } from "@/lib/bci/constants"
 
 const SOURCES: {
@@ -48,8 +53,13 @@ const SOURCES: {
 export function SessionInitScreen() {
   const router = useRouter()
   const searchParams = useSearchParams()
-  const { src, setSrc, setDatasetLabel } = useBciSession()
+  const authStatus = useRequireAuth()
+  const { src, setSrc, setDatasetLabel, setActiveSession } = useBciSession()
+
   const [connecting, setConnecting] = useState(false)
+  const [error, setError] = useState<string | null>(null)
+  const [file, setFile] = useState<File | null>(null)
+  const [hardwareWsUrl, setHardwareWsUrl] = useState("")
 
   useEffect(() => {
     const requested = searchParams.get("source")
@@ -60,36 +70,79 @@ export function SessionInitScreen() {
   }, [])
 
   async function launchSession(source: SessionSource) {
+    setError(null)
+
+    if (source === "upload" && !file) {
+      setError("Choose a .gdf or .csv recording to analyse.")
+      return
+    }
+    if (source === "hw" && !hardwareWsUrl.trim()) {
+      setError("Enter the WebSocket URL of your headset bridge.")
+      return
+    }
+
     setConnecting(true)
-    // Simulated dummy connect call — real integration will swap this for
-    // an actual upload/parse or hardware-pairing request.
-    await new Promise((resolve) => setTimeout(resolve, 1100 + Math.random() * 500))
-    setDatasetLabel(SOURCE_CONNECT_COPY[source].dataset)
-    router.push("/dashboard")
+
+    try {
+      let datasetId: string | undefined
+
+      if (source === "upload" && file) {
+        // Parsed synchronously server-side, so this resolving means the
+        // recording is usable and a session can be built on it.
+        const dataset = await uploadDataset(file)
+        datasetId = dataset._id
+        setDatasetLabel(dataset.originalName)
+      } else {
+        setDatasetLabel(SOURCE_CONNECT_COPY[source].dataset)
+      }
+
+      const mode = toSessionMode(source)
+      const session = await createSession({ mode, datasetId })
+
+      setActiveSession({
+        sessionId: session._id,
+        mode,
+        datasetId,
+        hardwareWsUrl: source === "hw" ? hardwareWsUrl.trim() : undefined,
+      })
+
+      router.push("/dashboard")
+    } catch (err) {
+      setError(err instanceof Error ? err.message : "Could not start the session")
+      setConnecting(false)
+    }
   }
 
   useEffect(() => {
     if (searchParams.get("autostart") !== "1") return
-    const requested = searchParams.get("source")
-    const source: SessionSource =
-      requested === "upload" || requested === "sim" || requested === "hw"
-        ? requested
-        : "sim"
-    // Defer out of the effect body so the initial setConnecting(true)
-    // doesn't fire synchronously during commit. `cancelled` (rather than a
-    // ref that outlives the effect) is what makes this safe under Strict
-    // Mode's mount→cleanup→remount: the cleanup only cancels the timeout
-    // belonging to *this* invocation, so the real mount still launches.
+    if (authStatus !== "authenticated") return
+    // Only simulation can start unattended. Upload needs a file and hardware
+    // needs a bridge URL, neither of which a link can supply.
+    if (searchParams.get("source") !== "sim") return
+
+    // Defer out of the effect body so the initial setConnecting(true) doesn't
+    // fire synchronously during commit. `cancelled` (rather than a ref that
+    // outlives the effect) is what makes this safe under Strict Mode's
+    // mount→cleanup→remount: the cleanup only cancels the timeout belonging to
+    // *this* invocation, so the real mount still launches.
     let cancelled = false
     const id = setTimeout(() => {
-      if (!cancelled) launchSession(source)
+      if (!cancelled) launchSession("sim")
     }, 0)
     return () => {
       cancelled = true
       clearTimeout(id)
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [searchParams])
+  }, [searchParams, authStatus])
+
+  if (authStatus === "loading") {
+    return (
+      <div className="mx-auto flex min-h-[60vh] w-full max-w-[560px] items-center justify-center px-4">
+        <div className="size-12 animate-spin rounded-full border-2 border-primary/25 border-t-primary" />
+      </div>
+    )
+  }
 
   if (connecting) {
     return (
@@ -172,6 +225,58 @@ export function SessionInitScreen() {
           )
         })}
       </div>
+
+      {src === "upload" && (
+        <div className="mb-6 flex flex-col gap-1.5">
+          <label
+            htmlFor="dataset-file"
+            className="font-mono text-[11px] tracking-[0.1em] text-muted-foreground"
+          >
+            RECORDING · GDF OR CSV
+          </label>
+          <Input
+            id="dataset-file"
+            type="file"
+            accept=".gdf,.csv"
+            onChange={(e) => setFile(e.target.files?.[0] ?? null)}
+          />
+          {file && (
+            <span className="font-mono text-[11px] text-muted-foreground">
+              {file.name} · {(file.size / 1_000_000).toFixed(1)} MB
+            </span>
+          )}
+        </div>
+      )}
+
+      {src === "hw" && (
+        <div className="mb-6 flex flex-col gap-1.5">
+          <label
+            htmlFor="hardware-url"
+            className="font-mono text-[11px] tracking-[0.1em] text-muted-foreground"
+          >
+            HEADSET BRIDGE · WEBSOCKET URL
+          </label>
+          <Input
+            id="hardware-url"
+            placeholder="ws://localhost:8080"
+            value={hardwareWsUrl}
+            onChange={(e) => setHardwareWsUrl(e.target.value)}
+          />
+          <span className="text-[11px] leading-relaxed text-muted-foreground">
+            Serial and Bluetooth are not reachable from the server, so a local
+            bridge process owns the headset and republishes its frames here.
+          </span>
+        </div>
+      )}
+
+      {error && (
+        <p
+          role="alert"
+          className="mb-4 rounded-lg border border-destructive/40 bg-destructive/10 px-3 py-2 text-[13px] text-destructive"
+        >
+          {error}
+        </p>
+      )}
 
       <Button
         size="lg"

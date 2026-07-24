@@ -104,12 +104,16 @@ class ResultsController {
           epochs: { $sum: 1 },
           meanConfidence: { $avg: '$confidence' },
           meanInferenceMs: { $avg: '$inferenceMs' },
+          // trueClass is absent entirely on an uncued epoch, and a missing
+          // path is not equal to null in an aggregation expression the way it
+          // is in a query filter — {$ne: [..., null]} matches it. Testing the
+          // type is what actually distinguishes "no cue" from "cued".
           correct: {
             $sum: {
               $cond: [
                 {
                   $and: [
-                    { $ne: ['$trueClass', null] },
+                    { $ne: [{ $type: '$trueClass' }, 'missing'] },
                     { $eq: ['$trueClass', '$predictedClass'] },
                   ],
                 },
@@ -119,7 +123,9 @@ class ResultsController {
             },
           },
           labelled: {
-            $sum: { $cond: [{ $ne: ['$trueClass', null] }, 1, 0] },
+            $sum: {
+              $cond: [{ $ne: [{ $type: '$trueClass' }, 'missing'] }, 1, 0],
+            },
           },
         },
       },

@@ -101,6 +101,12 @@ export class SessionManager {
     let processor: SignalProcessor | null = null;
     let initialised = false;
 
+    // Set only once the token has been verified, the session proven to belong
+    // to that user, and the session claimed for this socket to run. The
+    // failure path below writes session state, and msg.sessionId is supplied
+    // by the caller — see the comment there.
+    let ownedSessionId: string | null = null;
+
     ws.on('message', async (raw: RawData) => {
       let msg: InitMessage | ControlMessage;
 
@@ -128,16 +134,31 @@ export class SessionManager {
       initialised = true;
 
       try {
-        await this.runSession(ws, send, msg, (p) => (processor = p));
+        await this.runSession(
+          ws,
+          send,
+          msg,
+          (p) => (processor = p),
+          (id) => (ownedSessionId = id)
+        );
       } catch (error: any) {
         logger.error(`[Stream] Session failed: ${error.message}`);
         send(buildStatus('ERROR', error.message, msg.sessionId));
 
-        await Session.findByIdAndUpdate(msg.sessionId, {
-          status: SessionStatus.ERROR,
-          errorMessage: error.message,
-          endTime: new Date(),
-        }).catch(() => undefined);
+        // Only a session this socket established a claim to may be marked
+        // errored. msg.sessionId is caller-supplied, and a rejected token, a
+        // session owned by someone else, and a duplicate INIT against an
+        // already-running session all throw to here — writing on those paths
+        // would let any client, including one that never authenticated, set
+        // an arbitrary session to ERROR, and would let a client's own retry
+        // clobber the run it is still streaming.
+        if (ownedSessionId) {
+          await Session.findByIdAndUpdate(ownedSessionId, {
+            status: SessionStatus.ERROR,
+            errorMessage: error.message,
+            endTime: new Date(),
+          }).catch(() => undefined);
+        }
 
         ws.close(CLOSE.INTERNAL_ERROR, 'Session error');
       }
@@ -188,7 +209,8 @@ export class SessionManager {
     ws: WebSocket,
     send: (data: OutboundMessage) => void,
     msg: InitMessage,
-    onProcessor: (processor: SignalProcessor) => void
+    onProcessor: (processor: SignalProcessor) => void,
+    onClaimed: (sessionId: string) => void
   ) {
     // A socket carries no Authorization header, so the token rides in INIT.
     const user = await authenticateSocketToken(msg.token);
@@ -206,6 +228,12 @@ export class SessionManager {
         `Session is already ${session.status} and cannot be restarted`
       );
     }
+
+    // The caller owns this session and no other socket is running it, so from
+    // here a failure is genuinely this session's failure and may be recorded
+    // against it. Every check above rejects a session that is not ours to
+    // touch, and must leave the stored record exactly as it found it.
+    onClaimed(String(session._id));
 
     const modelId = msg.modelId || session.modelId;
     const processor = new SignalProcessor({

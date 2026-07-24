@@ -70,7 +70,12 @@ class DatasetController {
       );
     }
 
-    SuccessResponse(res, 'Dataset uploaded successfully', 201, dataset);
+    // filePath is an absolute path on the server and is stripped from every
+    // read route; echoing it back here would leak it on the one response that
+    // is guaranteed to reach the client.
+    const { filePath: _filePath, ...created } = dataset.toObject();
+
+    SuccessResponse(res, 'Dataset uploaded successfully', 201, created);
   });
 
   /**

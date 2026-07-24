@@ -1,13 +1,25 @@
 import * as THREE from "three"
 
-import { CHAN, EPOS, MI, MI_COLOR, MI_LABEL, type MiClass } from "./constants"
+import {
+  CHAN,
+  EPOS,
+  MI_COLOR,
+  MI_LABEL,
+  MI_PENDING,
+  TOPO_DB_RANGE,
+  WAVE_CHANNELS,
+  WAVE_SECONDS,
+  type MiClass,
+} from "./constants"
+import type { DataPacket, StreamConfig } from "./stream"
 
 export type ThreeCanvasKind = "field" | "hero" | "dash"
 export type Chart2DKind = "wave" | "psd" | "topo"
 
 export interface Telemetry {
   sessionTime: string
-  miClass: MiClass
+  /** Null until the first epoch closes. */
+  miClass: MiClass | null
   miLabel: string
   miColor: string
   confidencePct: number
@@ -29,7 +41,7 @@ interface ThreeSceneEntry {
   lastHeight?: number
 }
 
-/** Seeded PRNG (mulberry32) so demo output is stable across a session. */
+/** Seeded PRNG (mulberry32) so the decorative point clouds are stable. */
 function mulberry32(seed: number) {
   let a = seed
   return function rng() {
@@ -41,20 +53,50 @@ function mulberry32(seed: number) {
   }
 }
 
+const DEFAULT_SAMPLE_RATE = 250
+
 /**
- * Framework-agnostic simulation + rendering engine ported from the BCI
- * Visualizer design prototype. Screens mount/unmount their own canvases
- * (real routes, unlike the prototype's always-mounted single page), so
- * canvases are registered/unregistered rather than looked up by DOM id.
+ * Renders the dashboard from the live EEG stream.
+ *
+ * The engine draws; it does not invent. Everything scientific on screen —
+ * waveform, spectrum, scalp map, classification — arrives via
+ * {@link pushPacket} and is rendered as received. The PRNG survives only for
+ * the decorative three.js point clouds, which represent nothing.
+ *
+ * Screens mount/unmount their own canvases (real routes, unlike the prototype's
+ * single always-mounted page), so canvases are registered rather than looked up
+ * by DOM id.
  */
 export class BciEngine {
   private rng = mulberry32(1337)
-  private wave: number[][] = Array.from({ length: 8 }, () => new Array(220).fill(0))
-  private chanLvl: number[] = new Array(CHAN.length).fill(0).map(() => this.rng())
-  private cur = { cls: "left_hand" as MiClass, conf: 0.79, epoch: 143, sec: 0 }
-  private nextSwitch = 4.5
-  private topoAcc = 0
-  private motion = 55
+
+  // ---------- stream state ----------
+  private sampleRate = DEFAULT_SAMPLE_RATE
+  private channelNames: string[] = [...CHAN]
+  /** Indices into `channelNames` for the eight traces the waveform card shows. */
+  private waveIndices: number[] = []
+  private waveLength = DEFAULT_SAMPLE_RATE * WAVE_SECONDS
+  private wave: number[][] = []
+  /**
+   * Running peak amplitude used to normalise the traces. EEG is delivered in
+   * microvolts and its scale varies by an order of magnitude between subjects,
+   * so a fixed gain would either clip or flatline. Rises instantly and decays
+   * slowly, so a transient artifact doesn't permanently shrink the trace.
+   */
+  private waveScale = 1
+  private levelScale = 1
+  private chanLvl: number[] = new Array(CHAN.length).fill(0)
+
+  private psd: { freqs: number[]; power: number[] } | null = null
+  private topo: Record<string, number> | null = null
+
+  private cls: MiClass | null = null
+  private conf = 0
+  private epoch = -1
+
+  /** First packet's timestamp, so the clock reads from zero. */
+  private streamT0: number | null = null
+  private streamSeconds = 0
 
   private scenes = new Map<ThreeCanvasKind, ThreeSceneEntry>()
   private canvases2D = new Map<Chart2DKind, HTMLCanvasElement>()
@@ -70,14 +112,19 @@ export class BciEngine {
   private t0 = 0
   private last = 0
   private lastTel = 0
+  private topoAcc = 0
+  private motion = 55
   private running = false
 
   private telemetryListeners = new Set<TelemetryListener>()
   private channelListeners = new Set<ChannelLevelListener>()
 
+  constructor() {
+    this.resetBuffers()
+  }
+
   setDashboardActive(active: boolean) {
     this.dashboardActive = active
-    if (active) this.cur.sec = 0
   }
 
   setMotion(motion: number) {
@@ -95,6 +142,117 @@ export class BciEngine {
     this.channelListeners.add(cb)
     return () => {
       this.channelListeners.delete(cb)
+    }
+  }
+
+  // ---------- stream ingest ----------
+
+  private resetBuffers() {
+    this.waveLength = Math.max(2, Math.round(this.sampleRate * WAVE_SECONDS))
+    this.waveIndices = WAVE_CHANNELS.map((name) =>
+      this.channelNames.indexOf(name)
+    ).filter((index) => index >= 0)
+    this.wave = this.waveIndices.map(() => new Array(this.waveLength).fill(0))
+    this.chanLvl = new Array(this.channelNames.length).fill(0)
+    this.waveScale = 1
+    this.levelScale = 1
+  }
+
+  /**
+   * Adopt the montage and sample rate the server reported on STARTED, so the
+   * dashboard lays itself out from the stream rather than from a hardcoded
+   * assumption about the recording.
+   */
+  configure(config: StreamConfig) {
+    this.sampleRate = config.sampleRate || DEFAULT_SAMPLE_RATE
+    this.channelNames = config.channelNames?.length
+      ? config.channelNames
+      : [...CHAN]
+    this.resetBuffers()
+  }
+
+  /** Clear every trace of the previous session. */
+  resetStream() {
+    this.sampleRate = DEFAULT_SAMPLE_RATE
+    this.channelNames = [...CHAN]
+    this.resetBuffers()
+    this.psd = null
+    this.topo = null
+    this.cls = null
+    this.conf = 0
+    this.epoch = -1
+    this.streamT0 = null
+    this.streamSeconds = 0
+    this.emitTelemetry()
+  }
+
+  /**
+   * Ingest one packet.
+   *
+   * `samples` is on every packet; `psd`, `topographic` and `classification`
+   * only appear on the ~1 in 25 that closes an epoch. The last analysis seen is
+   * retained deliberately — the waveform keeps scrolling underneath a
+   * classification that is, correctly, a second old.
+   */
+  pushPacket(packet: DataPacket) {
+    if (this.streamT0 === null) this.streamT0 = packet.timestamp
+    // Stream time, not wall time: upload mode replays at 8x, so a clock driven
+    // by Date.now() would disagree with the data being drawn.
+    this.streamSeconds = Math.max(0, packet.timestamp - this.streamT0)
+
+    if (packet.samples?.length) {
+      this.appendSamples(packet.samples)
+      this.updateChannelLevels(packet.samples)
+    }
+
+    if (packet.epochIndex >= 0) this.epoch = packet.epochIndex
+    if (packet.psd) this.psd = packet.psd
+    if (packet.topographic) this.topo = packet.topographic
+
+    if (packet.classification) {
+      this.cls = packet.classification.predictedClass
+      this.conf = packet.classification.confidence
+    }
+  }
+
+  private appendSamples(samples: number[][]) {
+    let peak = 0
+
+    this.waveIndices.forEach((channelIndex, traceIndex) => {
+      const incoming = samples[channelIndex]
+      if (!incoming?.length) return
+
+      const buffer = this.wave[traceIndex]
+      for (const value of incoming) {
+        buffer.push(value)
+        const magnitude = Math.abs(value)
+        if (magnitude > peak) peak = magnitude
+      }
+
+      const overflow = buffer.length - this.waveLength
+      if (overflow > 0) buffer.splice(0, overflow)
+    })
+
+    // Attack immediately, decay ~2.5% a second at 25 packets/s.
+    this.waveScale = Math.max(peak, this.waveScale * 0.999, 1e-6)
+  }
+
+  private updateChannelLevels(samples: number[][]) {
+    let maxRms = 0
+    const rms = samples.map((channel) => {
+      if (!channel?.length) return 0
+      let sum = 0
+      for (const value of channel) sum += value * value
+      const value = Math.sqrt(sum / channel.length)
+      if (value > maxRms) maxRms = value
+      return value
+    })
+
+    this.levelScale = Math.max(maxRms, this.levelScale * 0.999, 1e-6)
+
+    for (let i = 0; i < this.chanLvl.length; i++) {
+      const target = Math.min(1, (rms[i] ?? 0) / this.levelScale)
+      this.chanLvl[i] += (target - this.chanLvl[i]) * 0.3
     }
   }
 
@@ -216,8 +374,8 @@ export class BciEngine {
         s.group.scale.set(p, p, p)
       } else {
         s.group.rotation.y += dt * 0.5 * speed
-        s.material.color.set(MI_COLOR[this.cur.cls])
-        const p = 1 + Math.sin(t * 3) * 0.05 * (0.5 + this.cur.conf)
+        s.material.color.set(this.cls ? MI_COLOR[this.cls] : MI_PENDING.color)
+        const p = 1 + Math.sin(t * 3) * 0.05 * (0.5 + this.conf)
         s.group.scale.set(p, p, p)
       }
       s.renderer.render(s.scene, s.camera)
@@ -236,27 +394,27 @@ export class BciEngine {
     return { ctx: cv.getContext("2d")!, w, h, d }
   }
 
-  private drawWave(t: number) {
+  private drawWave() {
     const cv = this.canvases2D.get("wave")
     if (!cv || !cv.clientWidth) return
     const { ctx, w, h, d } = this.fit(cv)
     ctx.setTransform(d, 0, 0, d, 0, 0)
     ctx.clearRect(0, 0, w, h)
-    const amp = 1
-    for (let c = 0; c < 8; c++) {
+
+    const traces = this.wave.length
+    if (!traces) return
+
+    const lane = h / traces
+    for (let c = 0; c < traces; c++) {
       const buf = this.wave[c]
-      buf.shift()
-      const f1 = 6 + c * 1.3
-      const f2 = 11 + c * 0.7
-      buf.push(Math.sin(t * f1 + c) * 0.5 + Math.sin(t * f2 * 0.5 + c * 2) * 0.35 + (this.rng() - 0.5) * 0.4)
       ctx.beginPath()
-      const hue = 165 - c * 9
-      ctx.strokeStyle = `hsla(${hue},75%,60%,.72)`
+      ctx.strokeStyle = `hsla(${165 - c * 9},75%,60%,.72)`
       ctx.lineWidth = 1.4
-      const base = (c + 0.5) * (h / 8)
+      const base = (c + 0.5) * lane
+
       for (let i = 0; i < buf.length; i++) {
         const x = (i / (buf.length - 1)) * w
-        const y = base + buf[i] * (h / 8) * 0.7 * amp
+        const y = base + (buf[i] / this.waveScale) * lane * 0.7
         if (i) ctx.lineTo(x, y)
         else ctx.moveTo(x, y)
       }
@@ -270,20 +428,14 @@ export class BciEngine {
     const { ctx, w, h, d } = this.fit(cv)
     ctx.setTransform(d, 0, 0, d, 0, 0)
     ctx.clearRect(0, 0, w, h)
-    const cls = this.cur.cls
-    const muBoost = cls === "left_hand" || cls === "right_hand" ? 1.4 : 0.7
-    const F = 80
-    const vals: number[] = []
-    for (let i = 0; i < F; i++) {
-      const f = (i / F) * 40
-      let p = 0.9 / (1 + f * 0.35)
-      p += muBoost * 0.6 * Math.exp(-Math.pow((f - 10) / 2.4, 2))
-      p += 0.5 * Math.exp(-Math.pow((f - 22) / 3.2, 2)) * (cls === "feet" ? 1.3 : 0.8)
-      p += (this.rng() - 0.5) * 0.05
-      vals.push(p)
-    }
-    const mx = Math.max(...vals) * 1.1
-    const bandX = (a: number, b: number): [number, number] => [(a / 40) * w, (b / 40) * w]
+
+    // The panel's axis is fixed at 0-40 Hz, which is also where the server
+    // truncates the spectrum it sends.
+    const maxFreq = 40
+    const bandX = (a: number, b: number): [number, number] => [
+      (a / maxFreq) * w,
+      (b / maxFreq) * w,
+    ]
     const [mx1, mx2] = bandX(8, 12)
     ctx.fillStyle = "rgba(52,214,245,.14)"
     ctx.fillRect(mx1, 0, mx2 - mx1, h)
@@ -291,14 +443,25 @@ export class BciEngine {
     ctx.fillStyle = "rgba(154,107,242,.14)"
     ctx.fillRect(bx1, 0, bx2 - bx1, h)
 
+    const psd = this.psd
+    if (!psd || psd.freqs.length < 2) return
+
+    let peak = 0
+    for (const p of psd.power) if (p > peak) peak = p
+    const mx = peak > 0 ? peak * 1.1 : 1
+
+    const pointAt = (i: number): [number, number] => [
+      (psd.freqs[i] / maxFreq) * w,
+      h - (psd.power[i] / mx) * h * 0.92,
+    ]
+
     ctx.beginPath()
     ctx.moveTo(0, h)
-    vals.forEach((p, i) => {
-      const x = (i / (F - 1)) * w
-      const y = h - (p / mx) * h * 0.92
+    for (let i = 0; i < psd.freqs.length; i++) {
+      const [x, y] = pointAt(i)
       ctx.lineTo(x, y)
-    })
-    ctx.lineTo(w, h)
+    }
+    ctx.lineTo((psd.freqs[psd.freqs.length - 1] / maxFreq) * w, h)
     ctx.closePath()
     const grd = ctx.createLinearGradient(0, 0, 0, h)
     grd.addColorStop(0, "rgba(55,226,154,.35)")
@@ -307,12 +470,11 @@ export class BciEngine {
     ctx.fill()
 
     ctx.beginPath()
-    vals.forEach((p, i) => {
-      const x = (i / (F - 1)) * w
-      const y = h - (p / mx) * h * 0.92
+    for (let i = 0; i < psd.freqs.length; i++) {
+      const [x, y] = pointAt(i)
       if (i) ctx.lineTo(x, y)
       else ctx.moveTo(x, y)
-    })
+    }
     ctx.strokeStyle = "rgba(234,245,239,.85)"
     ctx.lineWidth = 1.5
     ctx.stroke()
@@ -343,20 +505,46 @@ export class BciEngine {
     const cx = w / 2
     const cy = h / 2
     const R = Math.min(w, h) / 2 - 8
-    const cls = this.cur.cls
 
+    const outline = () => {
+      ctx.strokeStyle = "rgba(234,245,239,.35)"
+      ctx.lineWidth = 1.5
+      ctx.beginPath()
+      ctx.arc(cx, cy, R, 0, Math.PI * 2)
+      ctx.stroke()
+      ctx.beginPath()
+      ctx.moveTo(cx - 7, cy - R)
+      ctx.lineTo(cx, cy - R - 8)
+      ctx.lineTo(cx + 7, cy - R)
+      ctx.stroke()
+      for (const k in EPOS) {
+        const [ex, ey] = EPOS[k as keyof typeof EPOS]
+        ctx.beginPath()
+        ctx.arc(cx + ex * R, cy + ey * R, 1.6, 0, Math.PI * 2)
+        ctx.fillStyle = "rgba(234,245,239,.8)"
+        ctx.fill()
+      }
+    }
+
+    // Before the first epoch there is no scalp map to draw, but the head
+    // outline should still be there rather than an empty panel.
+    if (!this.topo) return outline()
+
+    // The server sends Mu power in dB relative to the epoch's own mean across
+    // electrodes, so 0 dB sits mid-ramp: blue is ERD (suppression, the
+    // contralateral signature of motor imagery) and amber/red is ERS.
     const vals: Record<string, number> = {}
     for (const k in EPOS) {
-      const [ex] = EPOS[k as keyof typeof EPOS]
-      let v = 0.35 + 0.1 * this.rng()
-      if (cls === "left_hand") v += ex > 0.1 ? 0.55 * this.cur.conf : 0
-      else if (cls === "right_hand") v += ex < -0.1 ? 0.55 * this.cur.conf : 0
-      else if (cls === "feet") v += Math.abs(ex) < 0.2 ? 0.5 * this.cur.conf : 0
-      vals[k] = Math.min(1, v)
+      const db = this.topo[k]
+      vals[k] =
+        db === undefined
+          ? 0.5
+          : Math.max(0, Math.min(1, (db + TOPO_DB_RANGE) / (2 * TOPO_DB_RANGE)))
     }
 
     const iw = Math.floor(w)
     const ih = Math.floor(h)
+    if (iw < 1 || ih < 1) return
     const img = ctx.createImageData(iw, ih)
     const dat = img.data
     const ent = Object.entries(EPOS)
@@ -378,8 +566,7 @@ export class BciEngine {
           num += wd * vals[ent[e][0]]
           den += wd
         }
-        const val = num / den
-        const c = this.topoColor(val)
+        const c = this.topoColor(num / den)
         dat[idx] = c[0]
         dat[idx + 1] = c[1]
         dat[idx + 2] = c[2]
@@ -387,24 +574,7 @@ export class BciEngine {
       }
     }
     ctx.putImageData(img, 0, 0)
-
-    ctx.strokeStyle = "rgba(234,245,239,.35)"
-    ctx.lineWidth = 1.5
-    ctx.beginPath()
-    ctx.arc(cx, cy, R, 0, Math.PI * 2)
-    ctx.stroke()
-    ctx.beginPath()
-    ctx.moveTo(cx - 7, cy - R)
-    ctx.lineTo(cx, cy - R - 8)
-    ctx.lineTo(cx + 7, cy - R)
-    ctx.stroke()
-    for (const k in EPOS) {
-      const [ex, ey] = EPOS[k as keyof typeof EPOS]
-      ctx.beginPath()
-      ctx.arc(cx + ex * R, cy + ey * R, 1.6, 0, Math.PI * 2)
-      ctx.fillStyle = "rgba(234,245,239,.8)"
-      ctx.fill()
-    }
+    outline()
   }
 
   // ---------- master loop ----------
@@ -416,47 +586,41 @@ export class BciEngine {
 
     this.updateThree(dt, t)
 
-    if (this.dashboardActive) {
-      this.cur.sec += dt
-      if (t > this.nextSwitch) {
-        this.nextSwitch = t + 3.5 + this.rng() * 3
-        this.cur.cls = MI[Math.floor(this.rng() * MI.length)]
-        this.cur.epoch++
-      }
-      this.cur.conf += (0.72 + this.rng() * 0.24 - this.cur.conf) * 0.06
+    if (!this.dashboardActive) return
 
-      this.drawWave(t)
-      this.drawPSD()
-      this.topoAcc += dt
-      if (this.topoAcc > 0.22) {
-        this.topoAcc = 0
-        this.drawTopo()
-      }
+    this.drawWave()
+    this.drawPSD()
 
-      for (let i = 0; i < this.chanLvl.length; i++) {
-        this.chanLvl[i] += (0.2 + this.rng() * 0.8 - this.chanLvl[i]) * 0.08
-      }
-      this.channelListeners.forEach((cb) => cb(this.chanLvl))
+    // The scalp map is a per-pixel inverse-distance interpolation over 22
+    // electrodes — far too costly for every frame, and it only changes once an
+    // epoch anyway.
+    this.topoAcc += dt
+    if (this.topoAcc > 0.22) {
+      this.topoAcc = 0
+      this.drawTopo()
+    }
 
-      if (now - this.lastTel > 140) {
-        this.lastTel = now
-        this.emitTelemetry()
-      }
+    this.channelListeners.forEach((cb) => cb(this.chanLvl))
+
+    if (now - this.lastTel > 140) {
+      this.lastTel = now
+      this.emitTelemetry()
     }
   }
 
   private emitTelemetry() {
-    const s = Math.floor(this.cur.sec)
+    const s = Math.floor(this.streamSeconds)
     const hh = String(Math.floor(s / 3600)).padStart(2, "0")
     const mm = String(Math.floor(s / 60) % 60).padStart(2, "0")
     const ss = String(s % 60).padStart(2, "0")
+
     const telemetry: Telemetry = {
       sessionTime: `${hh}:${mm}:${ss}`,
-      miClass: this.cur.cls,
-      miLabel: MI_LABEL[this.cur.cls],
-      miColor: MI_COLOR[this.cur.cls],
-      confidencePct: Math.round(this.cur.conf * 1000) / 10,
-      epoch: this.cur.epoch,
+      miClass: this.cls,
+      miLabel: this.cls ? MI_LABEL[this.cls] : MI_PENDING.label,
+      miColor: this.cls ? MI_COLOR[this.cls] : MI_PENDING.color,
+      confidencePct: Math.round(this.conf * 1000) / 10,
+      epoch: this.epoch,
       timestamp: new Date().toTimeString().slice(0, 8),
     }
     this.telemetryListeners.forEach((cb) => cb(telemetry))
