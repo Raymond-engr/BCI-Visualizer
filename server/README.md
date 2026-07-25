@@ -20,6 +20,18 @@ npm run verify:reference    # confirms the simulation recording parses
 npm run dev
 ```
 
+**Before the first run, `models/` has to be populated.** It ships empty, and
+nothing here can classify or simulate without it:
+
+| File | Where it comes from |
+| --- | --- |
+| `A01T.gdf` | BCI Competition IV Dataset 2a — [register and download](https://www.bbci.de/competition/iv/). Not redistributable. Replayed by simulation mode; point `REFERENCE_DATASET_PATH` at it. |
+| `csp_lda_global.onnx` + `csp_global.json` | `cd ../ml && python train.py path/to/A01T.gdf`. See [`ml/README.md`](../ml/README.md). |
+
+Both model files must come from the same training run. `validateEnv()` and
+`verify:reference` fail at boot rather than on the first request, so a missing
+recording surfaces immediately; a missing model surfaces on the first epoch.
+
 | URL | |
 | --- | --- |
 | `http://localhost:5000/api/v1` | REST API |
@@ -93,10 +105,16 @@ which is why `PUT /preferences` rejects anything else instead of substituting a
 near-enough filter.
 
 **CSP filters live outside the ONNX graph.** skl2onnx cannot export MNE's CSP
-transformer, so the training pipeline writes `csp_{modelId}.json` next to
-`csp_lda_{modelId}.onnx`. The spatial projection is applied in TypeScript and
-only the log-variance features go into the graph. Both files must be present in
-`MODEL_DIR` and must come from the same training run.
+transformer, so the training pipeline in [`ml/`](../ml/README.md) writes
+`csp_{modelId}.json` next to `csp_lda_{modelId}.onnx`. The spatial projection is
+applied in TypeScript and only the log-variance features go into the graph. Both
+files must be present in `MODEL_DIR` and must come from the same training run.
+
+`computeCSPFeatures` in `features.service.ts` reimplements MNE's
+`CSP.transform(transform_into='average_power', log=True)` by hand. Every
+training run asserts the two agree to 1e-9 before exporting, because a drift
+between them would not raise here — it would just shift the features away from
+what the LDA was fitted on.
 
 ---
 
@@ -285,8 +303,8 @@ See `.env.example`. The ones that matter:
 | `SAMPLE_RATE` | `250`. Must match the coefficient table. |
 | `BANDPASS_LOW` / `BANDPASS_HIGH` / `NOTCH_FREQ` | Must resolve to a precomputed section |
 | `MODEL_DIR` / `DEFAULT_MODEL_ID` | Where `csp_lda_*.onnx` and `csp_*.json` live |
-| `USE_ML_SERVICE` | `false` uses local ONNX; `true` forwards to the Python service |
-| `ML_SERVICE_URL` | Only read when `USE_ML_SERVICE=true` |
+| `USE_ML_SERVICE` | `false` uses local ONNX; `true` forwards to the [Python service](../ml/README.md) |
+| `ML_SERVICE_URL` | Only read when `USE_ML_SERVICE=true`. Must match the port `ml/` binds |
 | `REFERENCE_DATASET_PATH` | The recording simulation mode replays |
 | `MAX_UPLOAD_MB` | |
 

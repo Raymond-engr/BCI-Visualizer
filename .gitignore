@@ -1,0 +1,36 @@
+# dependencies
+node_modules/
+**/node_modules/
+
+# env files
+.env
+.env.*
+**/.env
+**/.env.*
+!.env.example
+!**/.env.example
+
+# logs
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+*.log
+
+# OS
+.DS_Store
+Thumbs.db
+
+# editors
+.vscode/
+.idea/
+
+# build output
+dist/
+build/
+.next/
+
+# python
+__pycache__/
+*.py[cod]
+.venv/
+venv/

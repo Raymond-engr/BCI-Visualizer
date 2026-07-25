@@ -85,18 +85,20 @@ const errorHandler = (
       message: error.message,
       stack: error.stack,
     });
-  } else if (process.env.NODE_ENV === 'production') {
-    if (error.isOperational) {
-      res.status(error.statusCode).json({
-        status: error.status,
-        message: error.message,
-      });
-    } else {
-      res.status(500).json({
-        status: 'error',
-        message: 'Server Error!, Something went wrong!',
-      });
-    }
+  } else if (error.isOperational) {
+    // Anything that is not development answers like production. Branching on
+    // 'production' alone left every other NODE_ENV — 'test', 'staging', an
+    // unset value — falling through without ever writing a response, so the
+    // request hung until the client timed out.
+    res.status(error.statusCode).json({
+      status: error.status,
+      message: error.message,
+    });
+  } else {
+    res.status(500).json({
+      status: 'error',
+      message: 'Server Error!, Something went wrong!',
+    });
   }
 };
 

@@ -1,17 +1,52 @@
 "use client"
 
+import { useEffect, useState } from "react"
 import Link from "next/link"
 
 import { Button } from "@/components/ui/button"
 import { Switch } from "@/components/ui/switch"
 import { useBciSession } from "@/contexts/BciSessionContext"
+import { useRequireAuth } from "@/hooks/useRequireAuth"
+import { getPreferenceOptions } from "@/lib/api/preferences"
+import type { PreferenceOptions } from "@/lib/api/types"
 import { SETTINGS_CATEGORIES, type SettingsCategory } from "@/lib/bci/constants"
 
 const CATEGORIES: SettingsCategory[] = ["signal", "hardware"]
 
 export function SettingsScreen() {
+  const authStatus = useRequireAuth()
   const { settingsCategory, setSettingsCategory } = useBciSession()
   const cat = SETTINGS_CATEGORIES[settingsCategory]
+
+  const [options, setOptions] = useState<PreferenceOptions | null>(null)
+
+  useEffect(() => {
+    if (authStatus !== "authenticated") return
+    let cancelled = false
+
+    getPreferenceOptions()
+      .then((next) => {
+        if (!cancelled) setOptions(next)
+      })
+      .catch(() => {
+        // The static values below remain as a fallback.
+      })
+
+    return () => {
+      cancelled = true
+    }
+  }, [authStatus])
+
+  // Both readouts are pipeline constants the server derives from SAMPLE_RATE,
+  // so they are read from it rather than restated here.
+  const readout =
+    settingsCategory === "signal"
+      ? options
+        ? `${options.epochSeconds.toFixed(1)} s`
+        : cat.rows[2].value
+      : options
+        ? `${options.sampleRate} Hz`
+        : cat.rows[2].value
 
   return (
     <div className="mx-auto max-w-6xl px-4 pb-20 pt-4 sm:px-6">
@@ -70,7 +105,7 @@ export function SettingsScreen() {
                 <div className="text-sm font-semibold">{cat.rows[2].title}</div>
               </div>
               <span className="rounded-lg border border-primary/30 px-3 py-1.5 font-mono text-[13px] text-primary">
-                {cat.rows[2].value}
+                {readout}
               </span>
             </div>
           </div>

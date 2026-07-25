@@ -4,6 +4,7 @@ import "./globals.css";
 
 import { BackgroundField } from "@/components/bci/BackgroundField";
 import { TopNav } from "@/components/bci/TopNav";
+import { AuthProvider } from "@/contexts/AuthContext";
 import { BciEngineProvider } from "@/contexts/BciEngineContext";
 import { BciSessionProvider } from "@/contexts/BciSessionContext";
 
@@ -42,13 +43,15 @@ export default function RootLayout({
       className={`dark ${hankenGrotesk.variable} ${bricolageGrotesque.variable} ${jetBrainsMono.variable} h-full antialiased`}
     >
       <body className="min-h-full flex flex-col bg-background text-foreground relative">
-        <BciEngineProvider>
-          <BciSessionProvider>
-            <BackgroundField />
-            <TopNav />
-            <main className="relative z-10 flex-1 pt-[78px]">{children}</main>
-          </BciSessionProvider>
-        </BciEngineProvider>
+        <AuthProvider>
+          <BciEngineProvider>
+            <BciSessionProvider>
+              <BackgroundField />
+              <TopNav />
+              <main className="relative z-10 flex-1 pt-[78px]">{children}</main>
+            </BciSessionProvider>
+          </BciEngineProvider>
+        </AuthProvider>
       </body>
     </html>
   );

@@ -41,11 +41,45 @@ export const MI_LABEL: Record<MiClass, string> = {
   feet: "FEET",
 }
 
+/** Sentence-case form, for prose contexts like the session breakdown. */
+export const MI_TITLE: Record<MiClass, string> = {
+  left_hand: "Left Hand",
+  right_hand: "Right Hand",
+  feet: "Feet",
+}
+
 export const MI_COLOR: Record<MiClass, string> = {
   left_hand: "#34D6F5",
   right_hand: "#9A6BF2",
   feet: "#37E29A",
 }
+
+/**
+ * Shown on the classification badge before the first epoch closes. An epoch is
+ * four seconds wide, so a real stream genuinely has nothing to predict for its
+ * first few seconds — that gap is a fact about the pipeline, not a loading state.
+ */
+export const MI_PENDING = { label: "AWAITING", color: "#9db4a9" } as const
+
+/**
+ * The eight electrodes drawn in the waveform card. The stream carries all 22,
+ * but the panel is laid out for eight traces, so these are the sensorimotor
+ * strip — where Mu ERD during hand imagery actually shows up — rather than the
+ * first eight in montage order, which would be mostly frontal.
+ */
+export const WAVE_CHANNELS = [
+  "FC3", "C5", "C3", "C1", "Cz", "C2", "C4", "C6",
+] as const
+
+/** Seconds of signal held in the waveform buffer. Matches the epoch window. */
+export const WAVE_SECONDS = 4
+
+/**
+ * Half-range, in dB, of the topographic colour scale. The server sends Mu power
+ * relative to the epoch's mean across electrodes, so 0 dB is the middle of the
+ * ramp and +/- this value saturates it.
+ */
+export const TOPO_DB_RANGE = 6
 
 export type SessionSource = "upload" | "sim" | "hw"
 
@@ -110,44 +144,3 @@ export const SETTINGS_CATEGORIES: Record<
   },
 }
 
-export const SAMPLE_SESSIONS = [
-  {
-    dataset: "BCICIV_2a — A01T",
-    date: "Jul 14, 2026",
-    duration: "04:12",
-    accuracy: "82.4%",
-    iconColor: "#34D6F5",
-    accent: "good",
-  },
-  {
-    dataset: "Live Simulation",
-    date: "Jul 12, 2026",
-    duration: "02:48",
-    accuracy: "76.1%",
-    iconColor: "#9A6BF2",
-    accent: "good",
-  },
-  {
-    dataset: "OpenBCI Cyton",
-    date: "Jul 09, 2026",
-    duration: "06:03",
-    accuracy: "71.8%",
-    iconColor: "#37E29A",
-    accent: "warn",
-  },
-  {
-    dataset: "BCICIV_2a — A03T",
-    date: "Jul 05, 2026",
-    duration: "03:37",
-    accuracy: "79.9%",
-    iconColor: "#34D6F5",
-    accent: "good",
-  },
-] as const
-
-/** Per-class accuracy breakdown shown on the latest session in Session History. */
-export const CLASS_BREAKDOWN: { cls: MiClass; label: string; pct: number }[] = [
-  { cls: "left_hand", label: "Left Hand", pct: 82 },
-  { cls: "right_hand", label: "Right Hand", pct: 74 },
-  { cls: "feet", label: "Feet", pct: 69 },
-]
