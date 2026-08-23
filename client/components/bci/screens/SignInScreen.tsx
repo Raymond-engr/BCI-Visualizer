@@ -101,14 +101,6 @@ export function SignInScreen() {
         >
           {pending ? "Signing in…" : "Sign In"}
         </Button>
-        <Button
-          variant="outline"
-          size="lg"
-          className="h-auto rounded-xl py-3.5 text-[14px]"
-          type="button"
-        >
-          Continue with SSO
-        </Button>
         <p className="mt-1 text-center text-[13px] text-muted-foreground">
           No account?{" "}
           <Link href="/sign-up" className="font-semibold text-primary">

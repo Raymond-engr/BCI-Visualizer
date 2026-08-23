@@ -56,10 +56,22 @@ export function LandingScreen() {
       <div className="flex items-center justify-between gap-3">
         <div className="flex items-center gap-5">
           <span className="font-mono text-[11px] tracking-[0.06em] text-muted-foreground">
-            Docs
+            <Link
+  href="/docs"
+  className="font-mono text-[11px] tracking-[0.06em] text-muted-foreground transition-colors hover:text-foreground"
+>
+  Docs
+</Link>
           </span>
           <span className="font-mono text-[11px] tracking-[0.06em] text-muted-foreground">
-            GitHub
+            <a
+              href="https://github.com/Raymond-engr/BCI-Visualizer"
+  target="_blank"
+  rel="noreferrer"
+  className="font-mono text-[11px] tracking-[0.06em] text-muted-foreground transition-colors hover:text-foreground"
+>
+  GitHub
+</a>
           </span>
         </div>
         <div className="flex gap-2.5">
@@ -131,7 +143,7 @@ export function LandingScreen() {
                 ACCURACY
               </div>
               <div className="font-heading text-[22px] font-bold text-primary">
-                98.4%
+                82.1%
               </div>
             </div>
             <div
