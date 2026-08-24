@@ -6,7 +6,7 @@ import validateRequest from '../middleware/validateRequest';
 
 const router = Router();
 
-const standardLimit = rateLimiter(20, 60 * 60 * 1000);
+const standardLimit = rateLimiter(50, 60 * 60 * 1000);
 
 const registerSchema = z.object({
   body: z.object({

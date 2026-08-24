@@ -1,5 +1,7 @@
 import * as THREE from "three";
 import { GLTFLoader } from "three/examples/jsm/loaders/GLTFLoader.js";
+import { DRACOLoader } from "three/examples/jsm/loaders/DRACOLoader.js";
+import { clone as skeletonClone } from "three/examples/jsm/utils/SkeletonUtils.js";
 
 import {
   CHAN,
@@ -19,7 +21,6 @@ export type Chart2DKind = "wave" | "psd" | "topo";
 
 export interface Telemetry {
   sessionTime: string;
-  /** Null until the first epoch closes. */
   miClass: MiClass | null;
   miLabel: string;
   miColor: string;
@@ -36,32 +37,97 @@ interface ThreeSceneEntry {
   scene: THREE.Scene;
   camera: THREE.PerspectiveCamera;
   group: THREE.Group;
-  /** Only set for the "field" background scene's particle cloud. */
   material?: THREE.PointsMaterial;
-  /** Only set for "hero"/"dash" once body.glb resolves — loading is async. */
   modelRoot?: THREE.Object3D | null;
+  mixer?: THREE.AnimationMixer;
+  actions?: {
+    idle: THREE.AnimationAction;
+    wave: THREE.AnimationAction;
+    jump: THREE.AnimationAction;
+  };
+  currentAction?: THREE.AnimationAction;
   canvas: HTMLCanvasElement;
   kind: ThreeCanvasKind;
   lastHeight?: number;
 }
 
-/**
- * The upper-body model is loaded once and cloned per canvas ("hero" and
- * "dash" each get their own instance), so two scenes never share one live
- * object graph.
- */
-let bodyModelPromise: Promise<THREE.Object3D> | null = null;
+// ---------- Character + animations (loaded once) ----------
+let characterPromise: Promise<{
+  scene: THREE.Object3D;
+  idleClip: THREE.AnimationClip;
+  waveClip: THREE.AnimationClip;
+  jumpClip: THREE.AnimationClip;
+}> | null = null;
 
-function loadBodyModel(): Promise<THREE.Object3D> {
-  if (!bodyModelPromise) {
-    bodyModelPromise = new GLTFLoader()
-      .loadAsync("/models/body.glb")
-      .then((gltf) => gltf.scene);
-  }
-  return bodyModelPromise;
+function loadCharacterAndClips() {
+  if (characterPromise) return characterPromise;
+
+  const loader = new GLTFLoader();
+  const draco = new DRACOLoader();
+  draco.setDecoderPath(
+    "https://www.gstatic.com/draco/versioned/decoders/1.5.7/",
+  );
+  loader.setDRACOLoader(draco);
+
+  characterPromise = Promise.all([
+    loader.loadAsync("/models/character.glb"),
+    loader.loadAsync("/models/idle.glb"),
+    loader.loadAsync("/models/wave.glb"),
+    loader.loadAsync("/models/jump.glb"),
+  ]).then(([charGltf, idleGltf, waveGltf, jumpGltf]) => {
+    draco.dispose();
+
+    console.log(
+      "character clips:",
+      charGltf.animations.map((c) => c.name),
+    );
+    console.log(
+      "idle clips:",
+      idleGltf.animations.map((c) => c.name),
+    );
+    console.log(
+      "wave clips:",
+      waveGltf.animations.map((c) => c.name),
+    );
+    console.log(
+      "jump clips:",
+      jumpGltf.animations.map((c) => c.name),
+    );
+
+    // Prefer clips from the animation files; fall back to the character file
+    const idleClip =
+      idleGltf.animations[0] ||
+      charGltf.animations.find((c) => /idle/i.test(c.name)) ||
+      charGltf.animations[0];
+
+    const waveClip =
+      waveGltf.animations[0] ||
+      charGltf.animations.find((c) => /wave|salute|raise/i.test(c.name));
+
+    const jumpClip =
+      jumpGltf.animations[0] ||
+      charGltf.animations.find((c) => /jump|hop/i.test(c.name));
+
+    if (!idleClip) throw new Error("No idle clip found in any file");
+    if (!waveClip) throw new Error("No wave clip found in any file");
+    if (!jumpClip) throw new Error("No jump clip found in any file");
+
+    idleClip.name = "idle";
+    waveClip.name = "wave";
+    jumpClip.name = "jump";
+
+    return {
+      scene: charGltf.scene,
+      idleClip,
+      waveClip,
+      jumpClip,
+    };
+  });
+
+  return characterPromise;
 }
 
-/** Tints every mesh in the model — used to reflect the live MI classification. */
+/** Tints every mesh – keeps the colour feedback you already had */
 function tintModel(root: THREE.Object3D, color: THREE.ColorRepresentation) {
   root.traverse((child) => {
     if (!(child instanceof THREE.Mesh)) return;
@@ -74,7 +140,7 @@ function tintModel(root: THREE.Object3D, color: THREE.ColorRepresentation) {
         mat instanceof THREE.MeshPhysicalMaterial
       ) {
         mat.color.set(color);
-        mat.emissive.set(color).multiplyScalar(0.15);
+        mat.emissive.set(color).multiplyScalar(0.12);
       }
     }
   });
@@ -334,13 +400,11 @@ export class BciEngine {
       return { renderer, scene, camera, group, material, canvas, kind };
     }
 
-    // "hero" and "dash": a lit, loaded human upper-body model in place of the
-    // old procedural point cloud. Lights are added to the scene rather than
-    // the group so they don't spin along with the model.
-    scene.add(new THREE.AmbientLight(0xffffff, 0.6));
-    const keyLight = new THREE.DirectionalLight(0xffffff, 1.2);
-    keyLight.position.set(2, 3, 4);
-    scene.add(keyLight);
+    // hero + dash – lit scene
+    scene.add(new THREE.AmbientLight(0xffffff, 0.65));
+    const key = new THREE.DirectionalLight(0xffffff, 1.15);
+    key.position.set(2.5, 4, 3);
+    scene.add(key);
 
     const entry: ThreeSceneEntry = {
       renderer,
@@ -351,17 +415,35 @@ export class BciEngine {
       kind,
     };
 
-    loadBodyModel()
-      .then((model) => {
-        const instance = model.clone(true);
-        instance.scale.setScalar(kind === "hero" ? 1.4 : 1.1);
-        instance.position.y = -1;
-        group.add(instance);
+    loadCharacterAndClips()
+      .then(({ scene: model, idleClip, waveClip, jumpClip }) => {
+        // IMPORTANT: use SkeletonUtils.clone for skinned Mixamo characters
+        const instance = skeletonClone(model);
+
+        // Mixamo models are usually in centimetres
+        instance.scale.setScalar(kind === "hero" ? 0.0145 : 0.0145);
+        instance.position.set(0, -1.35, 0);
+
+        // Create mixer + actions
+        const mixer = new THREE.AnimationMixer(instance);
+        const idle = mixer.clipAction(idleClip);
+        const wave = mixer.clipAction(waveClip);
+        const jump = mixer.clipAction(jumpClip);
+
+        idle.play();
+        entry.mixer = mixer;
+        entry.actions = { idle, wave, jump };
+        entry.currentAction = idle;
         entry.modelRoot = instance;
-        if (kind === "dash") tintModel(instance, MI_PENDING.color);
+
+        group.add(instance);
+
+        if (kind === "dash") {
+          tintModel(instance, MI_PENDING.color);
+        }
       })
-      .catch((error: unknown) => {
-        console.error("Failed to load /models/body.glb", error);
+      .catch((err) => {
+        console.error("Failed to load character / animations", err);
       });
 
     return entry;
@@ -398,28 +480,67 @@ export class BciEngine {
 
   private updateThree(dt: number, t: number) {
     const speed = this.motion / 55;
+
     this.scenes.forEach((s) => {
       if (!this.resizeScene(s)) return;
+
       if (s.kind === "field") {
         s.group.rotation.y += dt * 0.02 * speed;
         s.group.rotation.x = Math.sin(t * 0.05) * 0.1;
-      } else if (s.kind === "hero") {
-        s.group.rotation.y += dt * 0.18 * speed;
-        s.group.rotation.x += (this.mouse.y * 0.4 - s.group.rotation.x) * 0.05;
-        s.group.rotation.z = Math.sin(t * 0.3) * 0.04;
-        const p = 1 + Math.sin(t * 1.4) * 0.03;
-        s.group.scale.set(p, p, p);
       } else {
-        s.group.rotation.y += dt * 0.5 * speed;
-        if (s.modelRoot) {
+        // gentle idle spin
+        s.group.rotation.y += dt * (s.kind === "hero" ? 0.1 : 0.2) * speed;
+
+        // Update animation mixer
+        if (s.mixer) {
+          s.mixer.update(dt);
+        }
+
+        // Decide which animation should play
+        if (s.actions && s.modelRoot) {
+          let target: THREE.AnimationAction = s.actions.idle;
+
+          if (this.cls === "left_hand") {
+            target = s.actions.wave;
+            // Mirror for left side
+            s.modelRoot.scale.x = -Math.abs(s.modelRoot.scale.x);
+          } else if (this.cls === "right_hand") {
+            target = s.actions.wave;
+            s.modelRoot.scale.x = Math.abs(s.modelRoot.scale.x);
+          } else if (this.cls === "feet") {
+            target = s.actions.jump;
+            s.modelRoot.scale.x = Math.abs(s.modelRoot.scale.x);
+          } else {
+            s.modelRoot.scale.x = Math.abs(s.modelRoot.scale.x);
+          }
+
+          // Cross-fade when the target changes
+          if (s.currentAction !== target) {
+            target
+              .reset()
+              .setEffectiveTimeScale(1)
+              .setEffectiveWeight(1)
+              .play();
+            s.currentAction?.crossFadeTo(target, 0.35, true);
+            s.currentAction = target;
+          }
+
+          // Colour still follows classification
           tintModel(
             s.modelRoot,
             this.cls ? MI_COLOR[this.cls] : MI_PENDING.color,
           );
         }
-        const p = 1 + Math.sin(t * 3) * 0.05 * (0.5 + this.conf);
-        s.group.scale.set(p, p, p);
+
+        // subtle breathing scale
+        const breathe =
+          1 +
+          Math.sin(t * (s.kind === "hero" ? 1.3 : 2.6)) *
+            0.02 *
+            (0.4 + this.conf);
+        s.group.scale.setScalar(breathe);
       }
+
       s.renderer.render(s.scene, s.camera);
     });
   }
